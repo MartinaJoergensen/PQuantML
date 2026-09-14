@@ -224,6 +224,12 @@ class HGQQuantizer(nn.Module):
     def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
         if not self._built:
             self.build(tuple(x.shape), x.device)
+        elif self._f.device != x.device:
+            # Rarer than the __init__-placeholder bug build() fixes above: a quantizer
+            # already built (e.g. by a warm-up/tracing pass on one device) now being
+            # called with input on another. Not expected in normal eager training, but
+            # real once torch.compile's pre-graph calibration call is in the picture.
+            self.to(x.device)
 
         if training:
             with torch.no_grad():
