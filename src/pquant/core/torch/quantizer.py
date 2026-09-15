@@ -135,8 +135,15 @@ class Quantizer(nn.Module):
             return self.quantizer(x, k=self.k, i=self.i, f=self.f, training=False)
         else:
             i, f = self.compute_dynamic_bits(x)
-            self.i.data = i
-            self.f.data = f
+            # In-place into the existing parameter storage rather than rebinding .data: under CUDA graphs
+            # (torch.compile mode='reduce-overhead') a rebound .data would point into the graph's private pool.
+            with torch.no_grad():
+                if self.i.shape == i.shape and self.f.shape == f.shape:
+                    self.i.copy_(i)
+                    self.f.copy_(f)
+                else:
+                    self.i.data = i
+                    self.f.data = f
         x = self.quantizer(x, k=self.k, i=i, f=f, training=self.training)
         return x
 
