@@ -232,10 +232,12 @@ class HGQQuantizer(nn.Module):
             self.to(x.device)
 
         if training:
+            # In-place on the parameters themselves (not `.data`): AOTAutograd rejects mutations
+            # through a non-differentiable view of a graph input, so `.data.clamp_` breaks torch.compile.
             with torch.no_grad():
-                self._f.data.clamp_(self.f_min, self.f_max)
+                self._f.clamp_(self.f_min, self.f_max)
                 if self.overflow_mode != "WRAP":
-                    self._i.data.clamp_(self.i_min, self.i_max)
+                    self._i.clamp_(self.i_min, self.i_max)
 
         x_in = x  # kept for qnoise
 
@@ -319,9 +321,9 @@ class HGQQuantizer(nn.Module):
         Call at the end of each epoch.
         """
         with torch.no_grad():
-            self._f.data.clamp_(self.f_min, self.f_max)
+            self._f.clamp_(self.f_min, self.f_max)
             if self.overflow_mode != "WRAP":
-                self._i.data.clamp_(self.i_min, self.i_max)
+                self._i.clamp_(self.i_min, self.i_max)
             # WRAP: _i_raw is already clamped inside forward().
 
     def set_bits(self, i, f) -> None:
