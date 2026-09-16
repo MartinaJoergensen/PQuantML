@@ -209,9 +209,6 @@ class HGQQuantizer(nn.Module):
     # Bit-width mapping helpers
     # ------------------------------------------------------------------
 
-    def _bw_to_x(self, bw: torch.Tensor, x_shape: tuple) -> torch.Tensor:
-        return bw.expand(x_shape)
-
     def _x_to_bw_absmax(self, x: torch.Tensor) -> torch.Tensor:
         if len(self.homogeneous_axis) == 0:
             return x.abs()
@@ -244,14 +241,14 @@ class HGQQuantizer(nn.Module):
         if self.scaler is not None:
             x = x / self.scaler
 
-        # Round bit-width parameters to integers with STE so gradients flow.
-        f_bw = round_conv(self._f)  # bw-shaped
+        # Bit-width tensors keep their own (broadcastable) shape: homogeneous axes are 1. Expanding them to the
+        # input shape, as hgq2's bitwidth mapper does, would make every op on the bounds (2**i, 2**f, ...) run over
+        # the whole input and reduce back over it in backward, for values that are shared anyway.
+        f_bw = round_conv(self._f)  # rounded with STE so gradients flow
         k = self._k.float()
-        f_x = f_bw.expand(x.shape)
-        k_x = k.expand(x.shape)
 
         if self.overflow_mode == "WRAP":
-            out = self._stateless_quantizer.round(x, f_x)
+            out = self._stateless_quantizer.round(x, f_bw)
 
             if training:
                 # Track minimum integer bits needed for the current data.
@@ -265,23 +262,21 @@ class HGQQuantizer(nn.Module):
                         new_i = torch.maximum(self._i_raw - self.i_decay_speed, min_i)
                     self._i_raw.copy_(new_i.clamp(self.i_min, self.i_max))
             else:
+                i_bw = self.i
                 if self.is_data:
                     # Data quantizer: apply wrap-modulo after rounding (inference).
-                    i_x = self.i.expand(x.shape)
-                    out = self._stateless_quantizer.saturate(out, k_x, i_x, f_x)
+                    out = self._stateless_quantizer.saturate(out, k, i_bw, f_bw)
                 # Weight quantizer: rounded output is final, no saturation.
 
                 # Zero out pruned (total bits == 0) values.
-                i_x = self.i.expand(x.shape)
-                out = torch.where(k_x + i_x + f_x > 0, out, torch.zeros_like(out))
+                out = torch.where(k + i_bw + f_bw > 0, out, torch.zeros_like(out))
 
         else:  # SAT / SAT_SYM
-            i_bw = round_conv(self._i)  # bw-shaped, STE for gradient
-            i_x = i_bw.expand(x.shape)
-            out = self._stateless_quantizer(x, k_x, i_x, f_x, training)
+            i_bw = round_conv(self._i)
+            out = self._stateless_quantizer(x, k, i_bw, f_bw, training)
 
             if not training:
-                out = torch.where(k_x + i_x + f_x > 0, out, torch.zeros_like(out))
+                out = torch.where(k + i_bw + f_bw > 0, out, torch.zeros_like(out))
 
         if self.scaler is not None:
             out = out * self.scaler
