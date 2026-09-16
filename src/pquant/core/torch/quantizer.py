@@ -44,6 +44,8 @@ class Quantizer(nn.Module):
         place="datalane",
         dynamic_data=True,
         shape=None,
+        bitwidth_minmax=None,
+        integer_bits_min=None,
     ):
         super().__init__()
 
@@ -70,10 +72,52 @@ class Quantizer(nn.Module):
             self.is_data,
             granularity=self.granularity,
             gamma=hgq_gamma,
+            bitwidth_minmax=bitwidth_minmax,
         )
         self.is_pretraining = True
         self.hgq_gamma = hgq_gamma
+        self.bitwidth_minmax = bitwidth_minmax
+        self.integer_bits_min = None
+        if integer_bits_min is not None:
+            self.set_integer_bits_min(integer_bits_min)
         _register_final_compression_flag(self)
+
+    def set_integer_bits_min(self, value):
+        """Floor on the integer bits: a range this lane must keep covering (for instance the sum of a
+        softmax's exponentials, which lies in [0, keys]). ``bitwidth_minmax`` bounds the total width and
+        cannot express this: a 1-bit lane with i = -10 satisfies a floor of one bit yet represents only
+        0 and 2**-10."""
+        self.integer_bits_min = float(value)
+        if self.use_hgq:
+            self.quantizer.i_min = max(self.quantizer.i_min, self.integer_bits_min)
+            if self.quantizer.built:
+                with torch.no_grad():
+                    if self.quantizer.overflow_mode == "WRAP":
+                        self.quantizer._i_raw.clamp_(min=self.integer_bits_min)
+                    else:
+                        self.quantizer._i.clamp_(min=self.integer_bits_min)
+        else:
+            # Fixed-point lanes carry their bits in k/i/f: raise i (and the total) to the floor
+            with torch.no_grad():
+                self.i.clamp_(min=self.integer_bits_min)
+                self.b.data = self.k.data + self.i.data + self.f.data
+
+    def set_bitwidth_min(self, value):
+        """Floor on the total width k + i + f of an HGQ lane. With an integer floor this pins the
+        fractional bits too (``bitwidth_minmax`` is honoured by moving f), so a lane keeps both its range
+        and a known step. The maximum is raised to the floor when it was smaller."""
+        value = float(value)
+        b_min, b_max = self.bitwidth_minmax if self.bitwidth_minmax is not None else (value, max(value, 64.0))
+        self.bitwidth_minmax = (max(b_min, value), max(b_max, value))
+        if self.use_hgq:
+            self.quantizer.bitwidth_minmax = self.bitwidth_minmax
+            if self.quantizer.built:
+                self.quantizer.apply_bitwidth_constraint()
+        else:
+            # Fixed-point lanes: the width floor is met by adding fractional bits, keeping the range
+            with torch.no_grad():
+                self.f.data = torch.maximum(self.f.data, value - (self.k.data + self.i.data))
+                self.b.data = self.k.data + self.i.data + self.f.data
 
     def get_quantization_bits(self):
         if self.use_hgq:
@@ -110,7 +154,7 @@ class Quantizer(nn.Module):
 
     def calculate_bits_from_abs(self, abs_x):
         m = torch.ceil(torch.log2(abs_x + 1e-6))
-        int_bits = torch.clamp(m, min=0).clamp(max=self.b - self.k.to(m.device))
+        int_bits = torch.clamp(m, min=self.integer_bits_min or 0).clamp(max=self.b - self.k.to(m.device))
         frac_bits = torch.clamp(self.b - int_bits - self.k, min=0)
         return int_bits, frac_bits
 
@@ -187,6 +231,7 @@ class Quantizer(nn.Module):
                 self.quantizer._f.clamp_(self.quantizer.f_min, self.quantizer.f_max)
                 if self.quantizer.overflow_mode != "WRAP":
                     self.quantizer._i.clamp_(self.quantizer.i_min, self.quantizer.i_max)
+            self.quantizer.apply_bitwidth_constraint()
             self._sync_hgq_mirror_bits()
             _mark_final_compression_done(self)
             return
@@ -198,7 +243,16 @@ class Quantizer(nn.Module):
 
 
 def create_quantizer(
-    k, i, f, overflow, round_mode, is_heterogeneous, is_data, granularity=QuantizationGranularity.PER_WEIGHT, gamma=1e-8
+    k,
+    i,
+    f,
+    overflow,
+    round_mode,
+    is_heterogeneous,
+    is_data,
+    granularity=QuantizationGranularity.PER_WEIGHT,
+    gamma=1e-8,
+    bitwidth_minmax=None,
 ):
     if is_heterogeneous:
         return HGQQuantizer(
@@ -210,6 +264,7 @@ def create_quantizer(
             is_data=is_data,
             granularity=granularity,
             gamma=gamma,
+            bitwidth_minmax=bitwidth_minmax,
         )
     else:
         return get_fixed_quantizer(round_mode=round_mode, overflow_mode=overflow)

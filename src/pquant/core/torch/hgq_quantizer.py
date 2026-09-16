@@ -53,6 +53,9 @@ class HGQQuantizer(nn.Module):
         Controls which axes are shared. per_channel is not supported.
     gamma : float
         L1 regularisation coefficient on bit-widths.
+    bitwidth_minmax : tuple[float, float] | None
+        Optional (min, max) bounds on the total bitwidth k+i+f. Enforced by clamping f, which carries the
+        precision, and leaves i, which carries the representable range, alone. None means unbounded.
     i_decay_speed : float
         WRAP mode only. Rate at which tracked i can decrease per step.
         float('inf') means i is reset each step to the minimum required by data.
@@ -81,6 +84,7 @@ class HGQQuantizer(nn.Module):
         granularity: str = QuantizationGranularity.PER_WEIGHT,
         gamma: float = 1e-8,
         i_decay_speed: float = float("inf"),
+        bitwidth_minmax: tuple[float, float] | None = None,
         i_min: float = -23.0,
         i_max: float = 23.0,
         f_min: float = -24.0,
@@ -101,6 +105,10 @@ class HGQQuantizer(nn.Module):
         self.granularity = QuantizationGranularity(granularity).value
         self.gamma = gamma
         self.i_decay_speed = i_decay_speed
+        if bitwidth_minmax is not None:
+            b_min, b_max = bitwidth_minmax
+            assert b_min <= b_max, f"bitwidth_minmax must be (min, max), got {bitwidth_minmax}"
+        self.bitwidth_minmax = bitwidth_minmax
         self.i_min = i_min
         self.i_max = i_max
         self.f_min = f_min
@@ -205,6 +213,15 @@ class HGQQuantizer(nn.Module):
         """Total non-sign bits = relu(i + f). Zero when quantizer is pruned."""
         return torch.relu(self.i + self.f)
 
+    def apply_bitwidth_constraint(self) -> None:
+        """Clamp the total bitwidth k+i+f into ``bitwidth_minmax`` by moving f."""
+        if self.bitwidth_minmax is None or not self._built:
+            return
+        b_min, b_max = self.bitwidth_minmax
+        with torch.no_grad():
+            headroom = self._k.float() + (self._i_raw if self.overflow_mode == "WRAP" else self._i)
+            self._f.clamp_(min=b_min - headroom, max=b_max - headroom)
+
     # ------------------------------------------------------------------
     # Bit-width mapping helpers
     # ------------------------------------------------------------------
@@ -235,6 +252,7 @@ class HGQQuantizer(nn.Module):
                 self._f.clamp_(self.f_min, self.f_max)
                 if self.overflow_mode != "WRAP":
                     self._i.clamp_(self.i_min, self.i_max)
+            self.apply_bitwidth_constraint()
 
         x_in = x  # kept for qnoise
 
@@ -320,6 +338,7 @@ class HGQQuantizer(nn.Module):
             if self.overflow_mode != "WRAP":
                 self._i.clamp_(self.i_min, self.i_max)
             # WRAP: _i_raw is already clamped inside forward().
+        self.apply_bitwidth_constraint()
 
     def set_bits(self, i, f) -> None:
         """
