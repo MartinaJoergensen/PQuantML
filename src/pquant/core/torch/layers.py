@@ -1738,7 +1738,28 @@ def _is_training_stage(layer):
     return not (layer.pruning_layer._is_finetuning or layer.pruning_layer._is_pretraining)
 
 
+_compiled_model_losses = None
+
+
+def _is_compiled_module(model):
+    return isinstance(model, torch._dynamo.eval_frame.OptimizedModule)
+
+
 def get_model_losses(model, losses):
+    """Add the pruning and HGQ losses of every PQ layer to ``losses``.
+
+    Given a model wrapped by ``torch.compile``, the walk runs compiled too: eagerly it is a few
+    hundred tiny kernel launches per step, which otherwise dominate an HGQ training step.
+    """
+    if _is_compiled_module(model):
+        global _compiled_model_losses
+        if _compiled_model_losses is None:
+            _compiled_model_losses = torch.compile(_get_model_losses, dynamic=True)
+        return _compiled_model_losses(model._orig_mod, losses)
+    return _get_model_losses(model, losses)
+
+
+def _get_model_losses(model, losses):
     for layer in model.modules():
         if isinstance(layer, LAYERS_WITH_PRUNING_LAYER):
             if layer.enable_pruning and _is_training_stage(layer) and not layer.use_fitcompress:
