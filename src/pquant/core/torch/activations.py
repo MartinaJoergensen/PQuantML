@@ -1,3 +1,4 @@
+import math
 from math import prod
 from typing import TypeVar
 
@@ -338,6 +339,36 @@ class PQSoftmax(nn.Module):
         if self.use_hgq:
             self.input_quantizer.quantizer.build(input_shape, device)
             self.output_quantizer.quantizer.build(input_shape, device)
+        # The inverse table divides by the sum of the exponentials, which lies in [0, keys] (each exponential is
+        # at most 1): its input lane must keep the integer bits to hold that sum, whatever the bitwidth pressure.
+        accum_shape = tuple(1 if i in self.axes else s for i, s in enumerate(self.input_shape))
+        keys = prod(s for i, s in enumerate(input_shape) if i in self.axes)
+        self.inv_table.check_is_built(accum_shape, device)
+        if self.config.quantization_parameters.softmax_inverse_lane_floor:
+            self.inv_table.input_quantizer.set_integer_bits_min(math.ceil(math.log2(keys + 1)))
+        if self.config.quantization_parameters.softmax_range_floors:
+            self.exp_table.check_is_built(self.input_shape, device)
+            self._apply_range_floors(keys)
+
+    def _apply_range_floors(self, keys):
+        """Every lane with an analytically known range keeps it, plus the fractional bits it needs.
+
+        exp output i>=1 (holds exp(0)=1); inverse input i>=ceil(log2(keys+1)) (holds the sum, f>=0);
+        inverse output i>=1, f>=ceil(log2 keys) (holds 1 and resolves 1/keys); output (if quantized) the
+        same as the inverse output (a weight of 1 and of 1/keys must both be representable). The score
+        lane is left free -- attention may still go uniform under pressure, but as a normalized softmax.
+        """
+        lanes = [
+            (self.exp_table.output_quantizer, 1, 0),
+            (self.inv_table.input_quantizer, math.ceil(math.log2(keys + 1)), 0),
+            (self.inv_table.output_quantizer, 1, math.ceil(math.log2(keys))),
+        ]
+        if self.quantize_output:
+            lanes.append((self.output_quantizer, 1, math.ceil(math.log2(keys))))
+        for lane, i_min, f_min in lanes:
+            k = float(torch.as_tensor(lane.get_quantization_bits()[0]).max())
+            lane.set_integer_bits_min(i_min)
+            lane.set_bitwidth_min(k + i_min + f_min)
 
     def get_input_quantization_bits(self):
         return self.input_quantizer.get_quantization_bits()
@@ -384,7 +415,17 @@ class PQSoftmax(nn.Module):
             inputs = self.input_quantizer(inputs)
 
         if self.stable:
+            if mask is not None:
+                # Like HGQ's QSoftmax: masked keys must not set the row maximum, so that the largest
+                # visible exponential is exactly 1 and the sum stays in [1, keys].
+                mask = mask.to(inputs.dtype)
+                inputs = mask * inputs - (1 - mask) * 1e9
             inputs = torch.amax(inputs, dim=self.axes, keepdim=True) - inputs
+            if mask is not None:
+                # The masked exponentials are zeroed below anyway, so keep the 1e9 fill out of the exp
+                # table's own quantized lane: under WRAP it would wrap into garbage (exp overflows to inf,
+                # then 0 * inf = nan) and under SAT / HGQ it would inflate the lane's tracked integer range.
+                inputs = mask * inputs
 
         exp_inp = self.exp_table(inputs)
 
