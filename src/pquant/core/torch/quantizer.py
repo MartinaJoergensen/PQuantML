@@ -6,6 +6,29 @@ from pquant.core.torch.fixed_point_quantizer import get_fixed_quantizer
 from pquant.core.torch.hgq_quantizer import HGQQuantizer
 
 
+def _register_final_compression_flag(module):
+    """Checkpointed ``final_compression_done`` buffer plus a Python mirror for the forward path.
+
+    Testing the truthiness of a CUDA buffer is a device-to-host sync on every call, and under
+    torch.compile a branch on that tensor's value is a graph break (fatal under CUDA graphs
+    specifically -- an intermediate from one graph segment can get overwritten by the next
+    segment's replay before backward reads it). The forward path reads ``_final_compression_done``
+    instead; the mirror is set together with the buffer and follows it on state-dict load.
+    """
+    module.register_buffer("final_compression_done", torch.tensor(False))
+    module._final_compression_done = False
+    module.register_load_state_dict_post_hook(_sync_final_compression_flag)
+
+
+def _sync_final_compression_flag(module, incompatible_keys=None):
+    module._final_compression_done = bool(module.final_compression_done)
+
+
+def _mark_final_compression_done(module):
+    module.final_compression_done.fill_(True)
+    module._final_compression_done = True
+
+
 class Quantizer(nn.Module):
     def __init__(
         self,
@@ -50,7 +73,7 @@ class Quantizer(nn.Module):
         )
         self.is_pretraining = True
         self.hgq_gamma = hgq_gamma
-        self.register_buffer("final_compression_done", torch.tensor(False))
+        _register_final_compression_flag(self)
 
     def get_quantization_bits(self):
         if self.use_hgq:
@@ -131,7 +154,7 @@ class Quantizer(nn.Module):
     def forward(self, x):
         if self.use_hgq:
             return self.quantizer(x, training=self.training)
-        elif self.final_compression_done:
+        elif self._final_compression_done:
             return self.quantizer(x, k=self.k, i=self.i, f=self.f, training=False)
         else:
             i, f = self.compute_dynamic_bits(x)
@@ -161,17 +184,17 @@ class Quantizer(nn.Module):
             return
         if self.use_hgq:
             with torch.no_grad():
-                self.quantizer._f.data.clamp_(self.quantizer.f_min, self.quantizer.f_max)
+                self.quantizer._f.clamp_(self.quantizer.f_min, self.quantizer.f_max)
                 if self.quantizer.overflow_mode != "WRAP":
-                    self.quantizer._i.data.clamp_(self.quantizer.i_min, self.quantizer.i_max)
+                    self.quantizer._i.clamp_(self.quantizer.i_min, self.quantizer.i_max)
             self._sync_hgq_mirror_bits()
-            self.final_compression_done.fill_(True)
+            _mark_final_compression_done(self)
             return
         _, i, f = self.get_quantization_bits()
         self.i.data = i
         self.f.data = f
         self.b.data = i + f
-        self.final_compression_done.fill_(True)
+        _mark_final_compression_done(self)
 
 
 def create_quantizer(

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.nn.common_types import _size_1_t, _size_2_t
 
 from pquant.core.torch.activations import PQActivation, PQSoftmax
-from pquant.core.torch.quantizer import Quantizer
+from pquant.core.torch.quantizer import Quantizer, _mark_final_compression_done, _register_final_compression_flag
 from pquant.core.torch.utils import get_pruning_layer
 
 if typing.TYPE_CHECKING:
@@ -88,7 +88,7 @@ class PQWeightBiasBase(nn.Module):
         self.in_quant_granularity = in_quant_granularity if in_quant_granularity is not None else self.granularity
         self.bias_quant_granularity = bias_quant_granularity if bias_quant_granularity is not None else self.granularity
         self.out_quant_granularity = out_quant_granularity if out_quant_granularity is not None else self.granularity
-        self.register_buffer("final_compression_done", torch.tensor(False))
+        _register_final_compression_flag(self)
         self.built = False
         self.parallelization_factor = -1
         self.hgq_beta = config.quantization_parameters.hgq_beta
@@ -326,7 +326,7 @@ class PQDense(PQWeightBiasBase, nn.Linear):
 
     @property
     def weight(self):
-        if self.final_compression_done or self._is_fitcompress_pretraining():
+        if self._final_compression_done or self._is_fitcompress_pretraining():
             return self._weight
         if self.pruning_first:
             weight = self._prune(self._weight)
@@ -337,7 +337,7 @@ class PQDense(PQWeightBiasBase, nn.Linear):
 
     @property
     def bias(self):
-        if self.final_compression_done or self._is_fitcompress_pretraining():
+        if self._final_compression_done or self._is_fitcompress_pretraining():
             return self._bias
         bias = self.quantize(self._bias, self.bias_quantizer)
         return bias
@@ -346,7 +346,7 @@ class PQDense(PQWeightBiasBase, nn.Linear):
         self._weight.data = self.weight
         if self._bias is not None:
             self._bias.data = self.bias
-        self.final_compression_done.fill_(True)
+        _mark_final_compression_done(self)
 
     def forward(self, x):
         x = self.pre_forward(x)
@@ -394,7 +394,7 @@ class PQConvBase(PQWeightBiasBase):
 
     @property
     def weight(self):
-        if self.final_compression_done:
+        if self._final_compression_done:
             return self._weight
         if self.pruning_first:
             weight = self._prune(self._weight)
@@ -404,7 +404,7 @@ class PQConvBase(PQWeightBiasBase):
 
     @property
     def bias(self):
-        if self.final_compression_done:
+        if self._final_compression_done:
             return self._bias
         return self.quantize(self._bias, self.bias_quantizer)
 
@@ -412,7 +412,7 @@ class PQConvBase(PQWeightBiasBase):
         self._weight.data = self.weight
         if self._bias is not None:
             self._bias.data = self.bias
-        self.final_compression_done.fill_(True)
+        _mark_final_compression_done(self)
 
     def forward(self, x):
         x = self.pre_forward(x)
@@ -808,7 +808,7 @@ class PQBatchNormBase:
         else:
             self.register_parameter("_bias", None)
         self.built = False
-        self.register_buffer("final_compression_done", torch.tensor(False))
+        _register_final_compression_flag(self)
         self.is_pretraining = True
         self.post_fitcompress_calibration = False
         self.saved_inputs = []
@@ -864,7 +864,7 @@ class PQBatchNormBase:
     def apply_final_compression(self):
         self._weight.data = self.weight
         self._bias.data = self.bias
-        self.final_compression_done.fill_(True)
+        _mark_final_compression_done(self)
 
     def get_input_quantization_bits(self):
         return self.input_quantizer.get_quantization_bits()
@@ -880,13 +880,13 @@ class PQBatchNormBase:
 
     @property
     def weight(self):
-        if self.enable_quantization and not self.final_compression_done and not self._is_fitcompress_pretraining():
+        if self.enable_quantization and not self._final_compression_done and not self._is_fitcompress_pretraining():
             return self.weight_quantizer(self._weight)
         return self._weight
 
     @property
     def bias(self):
-        if self.enable_quantization and not self.final_compression_done and not self._is_fitcompress_pretraining():
+        if self.enable_quantization and not self._final_compression_done and not self._is_fitcompress_pretraining():
             return self.bias_quantizer(self._bias)
         return self._bias
 
@@ -1042,7 +1042,7 @@ class PQLayerNorm(nn.LayerNorm):
         else:
             self.register_parameter("_bias", None)
         self.built = False
-        self.register_buffer("final_compression_done", torch.tensor(False))
+        _register_final_compression_flag(self)
         self.is_pretraining = True
         self.post_fitcompress_calibration = False
         self.saved_inputs = []
@@ -1111,7 +1111,7 @@ class PQLayerNorm(nn.LayerNorm):
             self._weight.data = self.weight
         if self._bias is not None:
             self._bias.data = self.bias
-        self.final_compression_done.fill_(True)
+        _mark_final_compression_done(self)
 
     def get_input_quantization_bits(self):
         return self.input_quantizer.get_quantization_bits()
@@ -1132,7 +1132,7 @@ class PQLayerNorm(nn.LayerNorm):
     def weight(self):
         if self._weight is None:
             return None
-        if self.enable_quantization and not self.final_compression_done and not self._is_fitcompress_pretraining():
+        if self.enable_quantization and not self._final_compression_done and not self._is_fitcompress_pretraining():
             return self.weight_quantizer(self._weight)
         return self._weight
 
@@ -1140,7 +1140,7 @@ class PQLayerNorm(nn.LayerNorm):
     def bias(self):
         if self._bias is None:
             return None
-        if self.enable_quantization and not self.final_compression_done and not self._is_fitcompress_pretraining():
+        if self.enable_quantization and not self._final_compression_done and not self._is_fitcompress_pretraining():
             return self.bias_quantizer(self._bias)
         return self._bias
 
