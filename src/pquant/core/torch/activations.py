@@ -109,6 +109,18 @@ class PQActivation(nn.Module):
             place="datalane",
             dynamic_data=self.dynamic_data,
             granularity=self.config.quantization_parameters.granularity,
+            # Activation lanes had no bitwidth floor at all until 2026-09-30, while every
+            # weight/bias lane in layers.py has carried one since the 09-18 generalisation of
+            # Roope's mechanism. Unfloored, the resource regularizer drives a lane until its
+            # step exceeds its range and it can only emit zero -- and a lane emitting zero has
+            # no gradient, so nothing can push it back: a one-way trapdoor, not a decision.
+            # Measured in hgq-d16w6-l1: 14 GELU lanes dead, and softmax output dead in 5 of 8
+            # blocks. Note this does NOT reduce compression -- a dead DATA lane saves no
+            # hardware (q/k/v are still computed, their result just discarded), unlike a dead
+            # WEIGHT which folds away at synthesis. PQSoftmax's own lanes are deliberately left
+            # to _apply_range_floors, which knows their analytic ranges and intentionally frees
+            # the score lane.
+            bitwidth_minmax=getattr(self.config.quantization_parameters, "hgq_bitwidth_minmax", None),
         )
         self.input_quantizer = Quantizer(
             k=self.k_input,
@@ -122,6 +134,18 @@ class PQActivation(nn.Module):
             place="datalane",
             dynamic_data=self.dynamic_data,
             granularity=self.config.quantization_parameters.granularity,
+            # Activation lanes had no bitwidth floor at all until 2026-09-30, while every
+            # weight/bias lane in layers.py has carried one since the 09-18 generalisation of
+            # Roope's mechanism. Unfloored, the resource regularizer drives a lane until its
+            # step exceeds its range and it can only emit zero -- and a lane emitting zero has
+            # no gradient, so nothing can push it back: a one-way trapdoor, not a decision.
+            # Measured in hgq-d16w6-l1: 14 GELU lanes dead, and softmax output dead in 5 of 8
+            # blocks. Note this does NOT reduce compression -- a dead DATA lane saves no
+            # hardware (q/k/v are still computed, their result just discarded), unlike a dead
+            # WEIGHT which folds away at synthesis. PQSoftmax's own lanes are deliberately left
+            # to _apply_range_floors, which knows their analytic ranges and intentionally frees
+            # the score lane.
+            bitwidth_minmax=getattr(self.config.quantization_parameters, "hgq_bitwidth_minmax", None),
         )
         if self.use_hgq:
             self.input_quantizer.quantizer.build(input_shape, device)

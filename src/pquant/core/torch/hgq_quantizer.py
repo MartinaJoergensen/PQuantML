@@ -214,13 +214,15 @@ class HGQQuantizer(nn.Module):
         return torch.relu(self.i + self.f)
 
     def apply_bitwidth_constraint(self) -> None:
-        """Clamp the total bitwidth k+i+f into ``bitwidth_minmax`` by moving f."""
+        """Clamp the total bitwidth k+i+f into ``bitwidth_minmax`` by moving f,
+        and floor f individually so growing i can't push f negative to compensate."""
         if self.bitwidth_minmax is None or not self._built:
             return
         b_min, b_max = self.bitwidth_minmax
         with torch.no_grad():
             headroom = self._k.float() + (self._i_raw if self.overflow_mode == "WRAP" else self._i)
             self._f.clamp_(min=b_min - headroom, max=b_max - headroom)
+            self._f.clamp_(min=b_min)
 
     # ------------------------------------------------------------------
     # Bit-width mapping helpers
