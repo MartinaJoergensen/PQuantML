@@ -24,6 +24,11 @@ class BaseQuantizationModel(BaseModel):
     # non-zero minimum stops HGQ from pruning a tensor away (a zero-bit tensor outputs zeros), which matters when
     # per-tensor HGQ is combined with pruning. Layers take a `bitwidth_minmax` argument that overrides this.
     hgq_bitwidth_minmax: tuple[float, float] | None = Field(default=None)
+    # Floor on learned INTEGER bits i, i.e. on each lane's representable range (2**i).
+    # Distinct from hgq_bitwidth_minmax, which floors the total k+i+f and is not
+    # sufficient on its own: i=-23 with f=24 sums to 2, satisfying a 2-bit total floor
+    # while leaving the lane a range of ~1e-7 that any real weight saturates against.
+    hgq_integer_bits_min: float | None = Field(default=None)
     # PQSoftmax floors the integer bits of its inverse-table input lane at ceil(log2(keys + 1)): that lane carries
     # the sum of the exponentials, which lies in [0, keys], and without the floor the bitwidth pressure can
     # saturate the sum to zero and switch the attention off (a total-bitwidth bound cannot prevent this). Off
